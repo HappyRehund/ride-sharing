@@ -1,0 +1,51 @@
+#/ride-sharing/compose.yaml
+services:
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmqctl", "status"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    
+  auth-service:
+    build: ./auth-service
+    ports: 
+      - "3000:3000"
+    environment:
+      - RABBITMQ_HOST=rabbitmq
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    volumes:
+      - ./auth-service:/app
+      - /app/node_modules
+  
+  ride-service:
+    build: ./ride-service
+    ports: 
+      - "3001:3001"
+    environment:
+      - RABBITMQ_HOST=rabbitmq
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    volumes:
+      - ./ride-service:/app
+      - /app/node_modules
+  
+  driver-service:
+    build: ./driver-service
+    ports: 
+      - "3002:3002"
+    environment:
+      - RABBITMQ_HOST=rabbitmq
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    volumes:
+      - ./driver-service:/app
+      - /app/node_modules
