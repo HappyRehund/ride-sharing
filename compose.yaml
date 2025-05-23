@@ -1,5 +1,20 @@
 #/ride-sharing/compose.yaml
 services:
+  nginx-gateway: # 👈 New Nginx service
+    image: nginx:1.25-alpine # Using a specific stable version
+    ports:
+      - "800:800" # Expose Nginx port 80 to host port 800
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro # Mount your config file (read-only)
+    depends_on: # Nginx should start after backend services are ready
+      - auth-service
+      - ride-service
+      - driver-service
+    healthcheck: # Optional: basic Nginx health check
+        test: ["CMD-SHELL", "wget --spider --quiet http://localhost/api/health || exit 1"]
+        interval: 10s
+        timeout: 5s
+        retries: 3
   rabbitmq:
     image: rabbitmq:3-management-alpine
     ports:
@@ -10,42 +25,111 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-    
+
+  auth-db:
+    image: postgres:16-alpine
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: authuser
+      POSTGRES_PASSWORD: authpassword
+      POSTGRES_DB: authdb
+    volumes:
+      - auth_db_data:/var/lib/postgresql/data
+      - ./auth-service/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U authuser -d authdb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  driver-db: # New database for driver-service
+    image: postgres:16-alpine
+    ports:
+      - "5433:5432" # Expose on a different host port if needed for direct access
+    environment:
+      POSTGRES_USER: driveruser
+      POSTGRES_PASSWORD: driverpassword
+      POSTGRES_DB: driverdb
+    volumes:
+      - driver_db_data:/var/lib/postgresql/data
+      - ./driver-service/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U driveruser -d driverdb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  ride-db: # New database for ride-service
+    image: postgres:16-alpine
+    ports:
+      - "5434:5432" # Expose on a different host port if needed for direct access
+    environment:
+      POSTGRES_USER: rideuser
+      POSTGRES_PASSWORD: ridepassword
+      POSTGRES_DB: ridedb
+    volumes:
+      - ride_db_data:/var/lib/postgresql/data
+      - ./ride-service/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rideuser -d ridedb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   auth-service:
     build: ./auth-service
-    ports: 
-      - "3000:3000"
-    environment:
-      - RABBITMQ_HOST=rabbitmq
+    #ports:
+    #  - "3000:3000"
+    env_file:
+      - ./auth-service/.env
     depends_on:
       rabbitmq:
+        condition: service_healthy
+      auth-db:
         condition: service_healthy
     volumes:
       - ./auth-service:/app
       - /app/node_modules
   
-  ride-service:
-    build: ./ride-service
-    ports: 
-      - "3001:3001"
-    environment:
-      - RABBITMQ_HOST=rabbitmq
-    depends_on:
-      rabbitmq:
-        condition: service_healthy
-    volumes:
-      - ./ride-service:/app
-      - /app/node_modules
-  
+
   driver-service:
     build: ./driver-service
-    ports: 
-      - "3002:3002"
-    environment:
-      - RABBITMQ_HOST=rabbitmq
+    # ports:
+    #   - "3002:3002"
+    env_file:
+      - ./driver-service/.env
     depends_on:
       rabbitmq:
         condition: service_healthy
+      driver-db: # Depend on driver-db
+        condition: service_healthy
+      auth-service: # Explicit dependency for service discovery / auth calls
+        condition: service_started # or healthy if auth-service has a healthcheck
+      ride-service: # If it calls ride-service and needs it to be up
+        condition: service_started
     volumes:
       - ./driver-service:/app
       - /app/node_modules
+  
+  ride-service:
+    build: ./ride-service
+    # ports:
+    #   - "3001:3001"
+    env_file:
+      - ./ride-service/.env
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      ride-db: # Depend on ride-db
+        condition: service_started
+      auth-service: # Explicit dependency
+        condition: service_started
+    volumes:
+      - ./ride-service:/app
+      - /app/node_modules
+
+volumes:
+  auth_db_data:
+  driver_db_data: # New volume for driver-db
+  ride_db_data:   # New volume for ride-db
