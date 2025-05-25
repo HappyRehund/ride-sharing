@@ -78,7 +78,27 @@ const rabbitMqConnect = async () => {
       await newChannel.assertExchange("ride_events", "topic", {
         durable: false,
       });
+      await newChannel.assertExchange("driver_ride_actions", "topic", { durable: false }); 
 
+      const rideActionQueue = await newChannel.assertQueue("ride_service_driver_actions_queue", { exclusive: false }); // 👈 BARU
+      await newChannel.bindQueue(rideActionQueue.queue, "driver_ride_actions", "ride.action.#"); // Subscribe ke semua ride.action.*
+
+      newChannel.consume(rideActionQueue.queue, async (msg) => { // 👈 CONSUMER BARU
+        if (!msg) return;
+        try {
+          const eventData = JSON.parse(msg.content.toString());
+          const routingKey = msg.fields.routingKey;
+          console.log(`[Ride Service] Received event ${routingKey}:`, eventData);
+
+          if (routingKey === 'ride.action.accepted' || routingKey === 'ride.action.completed') {
+            await handleDriverRideAction(eventData);
+          }
+          newChannel.ack(msg);
+        } catch (err) {
+          console.error("[Ride Service] Error processing driver_ride_action event:", err);
+          newChannel.nack(msg, false, false); // Jangan requeue jika error parsing/logika
+        }
+      });
       // Tambahkan event listeners
       amqpConnection.on("error", (err) => {
         console.error("Ride-service RabbitMQ connection error:", err.message);
@@ -88,7 +108,7 @@ const rabbitMqConnect = async () => {
         console.warn("Ride-service RabbitMQ connection closed.");
       });
 
-      console.log("Ride-service connected to RabbitMQ");
+      console.log("Ride-service connected to RabbitMQ and listening for driver actions");
       channel = newChannel;
       return true;
     } catch (error) {
@@ -100,6 +120,66 @@ const rabbitMqConnect = async () => {
       if (retries === 0) throw error;
       await new Promise((resolve) => setTimeout(resolve, 5000));
     }
+  }
+};
+
+//handler for processing event from driver-service
+const handleDriverRideAction = async (eventData) => {
+  const { rideId, driverId, driverUsername, status, timestamp } = eventData;
+  let updateQuery;
+  let queryParams;
+  const actionTime = new Date(timestamp); // Gunakan timestamp dari event
+
+  // Validasi dasar
+  if (!rideId || !status) {
+    console.error("[Ride Service] Invalid event data for ride action:", eventData);
+    return; // Atau throw error agar di-nack
+  }
+
+  try {
+    if (status === "accepted") {
+      if (!driverId || !driverUsername) {
+        console.error("[Ride Service] Missing driver info for accepted status:", eventData);
+        return;
+      }
+      updateQuery = `UPDATE rides SET driver_id = $1, driver_username = $2, status = $3, accepted_at = $4, updated_at = $4
+                       WHERE id = $5 AND status = 'pending' RETURNING *`; // Pastikan transisi status valid
+      queryParams = [driverId, driverUsername, status, actionTime, rideId];
+    } else if (status === "completed") {
+      updateQuery = `UPDATE rides SET status = $1, completed_at = $2, updated_at = $2
+                       WHERE id = $3 AND driver_id = $4 AND (status = 'accepted' OR status = 'ongoing') RETURNING *`; // Izinkan complete dari accepted atau ongoing
+      queryParams = [status, actionTime, rideId, driverId];
+    } else {
+      console.warn(`[Ride Service] Unhandled ride action status: ${status} for ride ${rideId}`);
+      return;
+    }
+
+    const result = await pool.query(updateQuery, queryParams);
+
+    if (result.rows.length === 0) {
+      console.warn(`[Ride Service] Ride ${rideId} not found or not in a state to be '${status}'. Event:`, eventData);
+      // Ini bisa terjadi jika ada race condition atau event duplikat yang sudah diproses.
+      // Pertimbangkan logging atau mekanisme alert.
+      return;
+    }
+    const updatedRide = result.rows[0];
+    console.log(`[Ride Service] Ride ${updatedRide.id} status updated to '${status}' based on driver action event.`);
+
+    // Ride-service tetap mempublish event ride.status (ride.accepted, ride.completed)
+    // agar sistem lain (misal notifikasi, atau driver-service sendiri jika perlu) bisa tahu
+    if (channel) {
+      channel.publish(
+        "ride_events",
+        `ride.${status}`, // e.g., ride.accepted, ride.completed
+        Buffer.from(JSON.stringify(updatedRide))
+      );
+      console.log(`[Ride Service] Published ride.${status} event for ride ${updatedRide.id}`);
+    }
+
+  } catch (dbError) {
+    console.error(`[Ride Service] Error updating ride ${rideId} from driver action event:`, dbError);
+    // Pertimbangkan strategi retry 
+    throw dbError; // Lempar error agar pesan di-nack dan tidak di-ack jika retry tidak diimplementasikan di sini
   }
 };
 
@@ -206,73 +286,71 @@ app.get("/ride/:id", authMiddleware, async (req, res) => {
   }
 });
 
-// Internal endpoint for driver-service to update ride status
-app.post("/internal/update-ride", async (req, res) => {
-  const { rideId, driverId, driverUsername, status } = req.body;
+// (Now we don't need it because we handle it using rabbitMQ)
+// app.post("/internal/update-ride", async (req, res) => {
+//   const { rideId, driverId, driverUsername, status } = req.body;
+//   if (!rideId || !status) {
+//     return res
+//       .status(400)
+//       .json({ message: "Ride ID and status are required." });
+//   }
+//   if (status === "accepted" && (!driverId || !driverUsername)) {
+//     return res.status(400).json({
+//       message: "Driver ID and username are required for accepted status.",
+//     });
+//   }
 
-  // Basic validation
-  if (!rideId || !status) {
-    return res
-      .status(400)
-      .json({ message: "Ride ID and status are required." });
-  }
-  if (status === "accepted" && (!driverId || !driverUsername)) {
-    return res.status(400).json({
-      message: "Driver ID and username are required for accepted status.",
-    });
-  }
+//   try {
+//     let updateQuery;
+//     let queryParams;
+//     const now = new Date();
 
-  try {
-    let updateQuery;
-    let queryParams;
-    const now = new Date();
+//     if (status === "accepted") {
+//       updateQuery = `UPDATE rides SET driver_id = $1, driver_username = $2, status = $3, accepted_at = $4, updated_at = $4
+//                            WHERE id = $5 AND status = 'pending' RETURNING *`;
+//       queryParams = [driverId, driverUsername, status, now, rideId];
+//     } else if (status === "completed") {
+//       updateQuery = `UPDATE rides SET status = $1, completed_at = $2, updated_at = $2
+//                            WHERE id = $3 AND driver_id = $4 AND status = 'accepted' RETURNING *`; // Or 'ongoing' if you have that status
+//       queryParams = [status, now, rideId, driverId];
+//     } else if (status === "ongoing") {
+//      
+//       updateQuery = `UPDATE rides SET status = $1, started_at = $2, updated_at = $2
+//                            WHERE id = $3 AND driver_id = $4 AND status = 'accepted' RETURNING *`;
+//       queryParams = [status, now, rideId, driverId];
+//     }
+//     
+//     else {
+//       return res
+//         .status(400)
+//         .json({ message: "Invalid ride status for update." });
+//     }
 
-    if (status === "accepted") {
-      updateQuery = `UPDATE rides SET driver_id = $1, driver_username = $2, status = $3, accepted_at = $4, updated_at = $4
-                           WHERE id = $5 AND status = 'pending' RETURNING *`;
-      queryParams = [driverId, driverUsername, status, now, rideId];
-    } else if (status === "completed") {
-      updateQuery = `UPDATE rides SET status = $1, completed_at = $2, updated_at = $2
-                           WHERE id = $3 AND driver_id = $4 AND status = 'accepted' RETURNING *`; // Or 'ongoing' if you have that status
-      queryParams = [status, now, rideId, driverId];
-    } else if (status === "ongoing") {
-      // Example for another status
-      updateQuery = `UPDATE rides SET status = $1, started_at = $2, updated_at = $2
-                           WHERE id = $3 AND driver_id = $4 AND status = 'accepted' RETURNING *`;
-      queryParams = [status, now, rideId, driverId];
-    }
-    // Add more statuses like 'cancelled' as needed
-    else {
-      return res
-        .status(400)
-        .json({ message: "Invalid ride status for update." });
-    }
+//     const result = await pool.query(updateQuery, queryParams);
 
-    const result = await pool.query(updateQuery, queryParams);
+//     if (result.rows.length === 0) {
+//       return res.status(404).json({
+//         message: `Ride not found, not in a state to be '${status}', or driver mismatch.`,
+//       });
+//     }
+//     const updatedRide = result.rows[0];
 
-    if (result.rows.length === 0) {
-      return res.status(404).json({
-        message: `Ride not found, not in a state to be '${status}', or driver mismatch.`,
-      });
-    }
-    const updatedRide = result.rows[0];
-
-    if (channel) {
-      channel.publish(
-        "ride_events",
-        `ride.${status}`, // e.g., ride.accepted, ride.completed
-        Buffer.from(JSON.stringify(updatedRide))
-      );
-      console.log(
-        `Published ride update from internal: ${updatedRide.id} -> ${status}`
-      );
-    }
-    res.json({ message: "Ride updated successfully", ride: updatedRide });
-  } catch (dbError) {
-    console.error(`Error updating ride ${rideId} to ${status}:`, dbError);
-    res.status(500).json({ message: "Error updating ride" });
-  }
-});
+//     if (channel) {
+//       channel.publish(
+//         "ride_events",
+//         `ride.${status}`, // e.g., ride.accepted, ride.completed
+//         Buffer.from(JSON.stringify(updatedRide))
+//       );
+//       console.log(
+//         `Published ride update from internal: ${updatedRide.id} -> ${status}`
+//       );
+//     }
+//     res.json({ message: "Ride updated successfully", ride: updatedRide });
+//   } catch (dbError) {
+//     console.error(`Error updating ride ${rideId} to ${status}:`, dbError);
+//     res.status(500).json({ message: "Error updating ride" });
+//   }
+// });
 
 // Start server
 const startServer = async () => {

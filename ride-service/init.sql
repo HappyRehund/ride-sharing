@@ -15,10 +15,10 @@ CREATE TABLE IF NOT EXISTS rides (
     driver_username VARCHAR(255),
     requested_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     accepted_at TIMESTAMP WITH TIME ZONE,
-    started_at TIMESTAMP WITH TIME ZONE, -- When the ride actually begins
+    -- started_at TIMESTAMP WITH TIME ZONE, -- When the ride actually begins
     completed_at TIMESTAMP WITH TIME ZONE,
-    cancelled_at TIMESTAMP WITH TIME ZONE,
-    fare DECIMAL(10, 2), -- Optional: if you calculate fare
+    -- cancelled_at TIMESTAMP WITH TIME ZONE,
+    -- fare DECIMAL(10, 2), Optional: if you calculate fare
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 

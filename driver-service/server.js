@@ -85,6 +85,7 @@ const rabbitMqConnect = async () => {
       await newChannel.assertExchange("user_events", "topic", {
         durable: false,
       });
+      await newChannel.assertExchange("driver_ride_actions", "topic", { durable: false });
       const q = await newChannel.assertQueue("driver_service_queue", {
         exclusive: false,
       });
@@ -239,13 +240,13 @@ app.post("/accept-ride/:rideId", authMiddleware, async (req, res) => {
         .json({ message: "Ride not found, already accepted, or not pending" });
     }
 
-    // Update ride status in ride-service
-    await axios.post(`${RIDE_SERVICE_URL}/internal/update-ride`, {
-      rideId,
-      driverId,
-      driverUsername,
-      status: "accepted",
-    });
+    // Update ride status in ride-service (Now we don't need it because we handle it using rabbitMQ)
+    // await axios.post(`${RIDE_SERVICE_URL}/internal/update-ride`, {
+    //   rideId,
+    //   driverId,
+    //   driverUsername,
+    //   status: "accepted",
+    // });
 
     // Update driver status locally
     await client.query(
@@ -260,7 +261,24 @@ app.post("/accept-ride/:rideId", authMiddleware, async (req, res) => {
     // Or: await client.query("UPDATE pending_rides SET status = 'accepted' WHERE ride_id = $1", [rideId]);
 
     await client.query("COMMIT");
-    res.json({ message: "Ride accepted successfully", rideId });
+
+    if (channel) {
+      const eventPayload = {
+        rideId,
+        driverId,
+        driverUsername,
+        status: "accepted", // Status baru yang diinginkan
+        timestamp: new Date().toISOString(),
+      };
+      channel.publish(
+        "driver_ride_actions",      // Exchange baru
+        "ride.action.accepted",     // Routing key baru
+        Buffer.from(JSON.stringify(eventPayload))
+      );
+      console.log(`[Driver Service] Published ride.action.accepted event for ride ${rideId}`);
+    }
+
+    res.json({ message: "Ride accepted processed, status update will be eventual", rideId });
   } catch (error) {
     await client.query("ROLLBACK");
     console.error(
@@ -305,13 +323,13 @@ app.post("/complete-ride/:rideId", authMiddleware, async (req, res) => {
         });
     }
 
-    // Update ride status in ride-service
-    await axios.post(`${RIDE_SERVICE_URL}/internal/update-ride`, {
-      rideId,
-      driverId,
-      driverUsername, // Send username from auth token, or fetch from driver profile
-      status: "completed",
-    });
+    // Update ride status in ride-service (Now we don't need it because we handle it using rabbitMQ)
+    // await axios.post(`${RIDE_SERVICE_URL}/internal/update-ride`, {
+    //   rideId,
+    //   driverId,
+    //   driverUsername, // Send username from auth token, or fetch from driver profile
+    //   status: "completed",
+    // });
 
     // Update driver status locally
     await client.query(
@@ -320,6 +338,23 @@ app.post("/complete-ride/:rideId", authMiddleware, async (req, res) => {
     );
 
     await client.query("COMMIT");
+
+    if (channel) {
+      const eventPayload = {
+        rideId,
+        driverId,
+        driverUsername: driver.username, // Ambil dari data driver di DB jika perlu
+        status: "completed", // Status baru yang diinginkan
+        timestamp: new Date().toISOString(),
+      };
+      channel.publish(
+        "driver_ride_actions",      // Exchange baru
+        "ride.action.completed",    // Routing key baru
+        Buffer.from(JSON.stringify(eventPayload))
+      );
+      console.log(`[Driver Service] Published ride.action.completed event for ride ${rideId}`);
+    }
+
     res.json({ message: "Ride completed successfully", rideId });
   } catch (error) {
     await client.query("ROLLBACK");
